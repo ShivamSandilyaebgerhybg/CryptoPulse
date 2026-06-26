@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Real-Time Cryptocurrency Tracker</title>
+
+  <!-- Google Font -->
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
+
+  <!-- Chart.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <!-- Main stylesheet -->
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app" class="app">
+    <header class="header">
+      <div class="brand">
+        <svg class="logo" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5" opacity="0.25"/></svg>
+        <div>
+          <h1 class="title">CryptoPulse</h1>
+          <p class="subtitle">Real-time crypto prices — frontend only</p>
+        </div>
+      </div>
+
+      <div class="controls">
+        <div class="control-row">
+          <label class="sr-only" for="search">Search coins</label>
+          <input id="search" placeholder="Search (BTC, Ethereum, Tether...)" type="search" />
+
+          <select id="currency" aria-label="Display currency">
+            <option value="usd">USD</option>
+            <option value="inr">INR</option>
+          </select>
+
+          <button id="themeToggle" title="Toggle theme">🌙</button>
+        </div>
+
+        <div class="control-row small">
+          <button id="watchlistBtn" class="link-btn">Watchlist</button>
+          <span class="status" id="status">Loading…</span>
+        </div>
+      </div>
+    </header>
+
+    <main class="main">
+      <section class="global-stats" id="globalStats" aria-live="polite">
+        <!-- Filled in by JS -->
+      </section>
+
+      <section class="grid" id="cardsGrid" aria-live="polite">
+        <!-- Loading skeletons / cards go here -->
+      </section>
+    </main>
+
+    <!-- Modal for coin details -->
+    <div id="modal" class="modal" aria-hidden="true" role="dialog" aria-modal="true">
+      <div class="modal-content" role="document">
+        <button id="modalClose" class="modal-close" aria-label="Close details">✕</button>
+        <div id="modalBody">
+          <!-- populated by JS -->
+        </div>
+      </div>
+    </div>
+
+    <footer class="footer">
+      <small>Data from CoinGecko • Auto-refresh every <span id="refreshInterval">15</span>s</small>
+    </footer>
+  </div>
+
+  <!-- Main script -->
+  <script src="script.js" defer></script>
+</body>
+</html>
