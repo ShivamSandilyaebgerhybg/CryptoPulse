@@ -3,7 +3,7 @@
 
 // Config
 const API_BASE = 'https://api.coingecko.com/api/v3';
-const REFRESH_SECONDS = 15;           
+const REFRESH_SECONDS = 30;           
 const COIN_COUNT = 40;                
 let vsCurrency = localStorage.getItem('cp_currency') || 'usd';
 let coinsData = [];                   // cached coins list
@@ -327,7 +327,13 @@ async function loadDetailChart(coinId, days=30){
     });
   } catch (err) {
     console.error(err);
-    canvas.parentElement.innerHTML = '<div style="padding:1rem;color:var(--danger)">Chart failed to load.</div>';
+    if (detailChart) {
+      detailChart.destroy();
+      detailChart = null;
+    }
+
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height); 
   }
 }
 
