@@ -11,6 +11,66 @@ let refreshTimer = null;
 let charts = {};                      // small sparkline charts
 let detailChart = null;
 
+// Chart data cache: key = `${coinId}-${vsCurrency}-${days}`, value = { data, timestamp }
+let chartCache = new Map();
+const CACHE_TTL = 60_000; // 1 minute
+
+// Coin detail cache: key = `${coinId}-${vsCurrency}`, value = { data, timestamp }
+let coinDetailCache = new Map();
+
+// ---- Request queue + retry-with-backoff ----
+// The free CoinGecko tier allows only a handful of calls per minute.
+// Firing several requests back-to-back (e.g. clicking through coins fast)
+// causes 429s even with caching in place. This wrapper:
+//   1. Spaces every API call out by a minimum gap (MIN_GAP_MS)
+//   2. Automatically retries on 429 with exponential backoff
+let requestQueue = Promise.resolve();
+let lastRequestTime = 0;
+const MIN_GAP_MS = 1500;      // minimum time between any two API calls
+const MAX_RETRIES = 3;
+const BASE_BACKOFF_MS = 2000; // first retry waits ~2s, then ~4s, then ~8s
+
+function sleep(ms){ return new Promise(res => setTimeout(res, ms)); }
+
+// Queued, auto-retrying fetch. Use this for every CoinGecko API call.
+function apiFetch(url){
+  // Chain onto the queue so calls never overlap/burst.
+  const run = requestQueue.then(async () => {
+    const wait = Math.max(0, MIN_GAP_MS - (Date.now() - lastRequestTime));
+    if (wait > 0) await sleep(wait);
+    lastRequestTime = Date.now();
+
+    let lastErr;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++){
+      const r = await fetch(url);
+
+      if (r.status === 429){
+        lastErr = new Error('RATE_LIMITED');
+        if (attempt < MAX_RETRIES){
+          const backoff = BASE_BACKOFF_MS * Math.pow(2, attempt);
+          console.warn(`429 on ${url} — retrying in ${backoff}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
+          await sleep(backoff);
+          lastRequestTime = Date.now();
+          continue;
+        }
+        throw lastErr;
+      }
+
+      if (!r.ok){
+        throw new Error(`HTTP_${r.status}`);
+      }
+
+      return r.json();
+    }
+    throw lastErr;
+  });
+
+  // Keep the queue chain alive even if this call fails, so later calls
+  // still wait their turn instead of piling up.
+  requestQueue = run.catch(() => {});
+  return run;
+}
+
 // DOM
 const statusEl = document.getElementById('status');
 const cardsGrid = document.getElementById('cardsGrid');
@@ -62,25 +122,13 @@ async function fetchData() {
     setStatus("Fetching market data...");
 
     // Global Stats
-    const gResp = await fetch(`${API_BASE}/global`);
-
-    if (!gResp.ok) {
-      throw new Error(`Global API failed: ${gResp.status}`);
-    }
-
-    const gJson = await gResp.json();
+    const gJson = await apiFetch(`${API_BASE}/global`);
     renderGlobal(gJson.data);
 
-    // Coins 
-    const coinsResp = await fetch(
+    // Coins
+    const coinsJson = await apiFetch(
       `${API_BASE}/coins/markets?vs_currency=${vsCurrency}&order=market_cap_desc&per_page=${COIN_COUNT}&page=1&sparkline=true&price_change_percentage=24h`
     );
-
-    if (!coinsResp.ok) {
-      throw new Error(`Coins API failed: ${coinsResp.status}`);
-    }
-
-    const coinsJson = await coinsResp.json();
 
     coinsData = coinsJson;
 
@@ -94,7 +142,9 @@ async function fetchData() {
 
       console.error(err);
 
-      if (lastUpdated) {
+      if (err.message === 'RATE_LIMITED') {
+        setStatus(lastUpdated ? `Last updated: ${lastUpdated} • Rate limited, will retry...` : 'Rate limited — please wait...');
+      } else if (lastUpdated) {
         setStatus(`Last updated: ${lastUpdated} • Retrying...`);
       } else {
         setStatus("Unable to fetch data. Retrying...");
@@ -226,23 +276,36 @@ async function openDetails(coinId){
   modal.style.display = 'flex';
   modalBody.innerHTML = `<div style="padding:1rem">Loading details…</div>`;
 
-  try {
-    // coin details
-    const [coinRes, chartRes] = await Promise.all([
-      fetch(`${API_BASE}/coins/${coinId}?localization=false&tickers=false&market_data=true&community_data=false&developer_data=false&sparkline=false`),
-      fetch(`${API_BASE}/coins/${coinId}/market_chart?vs_currency=${vsCurrency}&days=30&interval=daily`)
-    ]);
-    const coin = await coinRes.json();
-    const chartData = await chartRes.json();
+  // Pause background auto-refresh while modal is open so it doesn't
+  // compete for rate-limit budget with the chart requests below.
+  if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
 
-    renderModal(coin, chartData);
+  const cacheKey = `${coinId}-${vsCurrency}`;
+  const cached = coinDetailCache.get(cacheKey);
+  if (cached && (Date.now() - cached.timestamp) < CACHE_TTL) {
+    renderModal(cached.data);
+    return;
+  }
+
+  try {
+    // Only fetch coin metadata here — the chart is loaded separately
+    // by loadDetailChart() once the modal is rendered, so we don't
+    // waste a duplicate market_chart call on every open.
+    // apiFetch queues this call and auto-retries on 429, so switching
+    // between coins quickly no longer just fails outright.
+    const coin = await apiFetch(`${API_BASE}/coins/${coinId}?localization=false&tickers=false&market_data=true&community_data=false&developer_data=false&sparkline=false`);
+
+    coinDetailCache.set(cacheKey, { data: coin, timestamp: Date.now() });
+    renderModal(coin);
   } catch (err) {
     console.error(err);
-    modalBody.innerHTML = `<div style="padding:1rem;color:var(--danger)">Failed to load details.</div>`;
+    modalBody.innerHTML = err.message === 'RATE_LIMITED'
+      ? `<div style="padding:1rem;color:var(--danger)">Rate limited — retrying automatically didn't help this time. Please wait ~10s and try again.</div>`
+      : `<div style="padding:1rem;color:var(--danger)">Failed to load details.</div>`;
   }
 }
 
-function renderModal(coin, chartData){
+function renderModal(coin){
   const market = coin.market_data || {};
   modalBody.innerHTML = `
     <div style="display:flex;gap:1rem;align-items:center;margin-bottom:0.5rem">
@@ -292,49 +355,89 @@ function renderModal(coin, chartData){
     });
   });
 
-  // timeframe buttons
+  // timeframe buttons — debounced so rapid clicking doesn't spam the API
+  const debouncedLoadChart = debounce((days) => loadDetailChart(coin.id, days), 400);
   modalBody.querySelectorAll('.timeframe').forEach(btn => {
-    btn.addEventListener('click', async (e) => {
-      const days = btn.dataset.days;
-      await loadDetailChart(coin.id, days);
+    btn.addEventListener('click', () => {
+      // visually mark active button
+      modalBody.querySelectorAll('.timeframe').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      debouncedLoadChart(btn.dataset.days);
     });
   });
 
   // show 30-day by default
+  const defaultBtn = modalBody.querySelector('.timeframe[data-days="30"]');
+  if (defaultBtn) defaultBtn.classList.add('active');
   loadDetailChart(coin.id, 30);
 }
 
-// Load & draw detail chart
+// Load & draw detail chart (with caching + real error handling)
 async function loadDetailChart(coinId, days=30){
   const canvas = document.getElementById('detailChart');
   if(!canvas) return;
-  canvas.getContext('2d').clearRect(0,0,canvas.width, canvas.height);
+
+  const cacheKey = `${coinId}-${vsCurrency}-${days}`;
+  const cached = chartCache.get(cacheKey);
+
+  // Serve from cache if fresh — avoids re-hitting the API when switching
+  // back to a range (or coin) already loaded recently.
+  if (cached && (Date.now() - cached.timestamp) < CACHE_TTL) {
+    drawDetailChart(canvas, cached.data);
+    return;
+  }
+
+  showChartMessage(canvas, 'Loading…');
 
   try {
-    const r = await fetch(`${API_BASE}/coins/${coinId}/market_chart?vs_currency=${vsCurrency}&days=${days}&interval=hourly`);
-    const data = await r.json();
-    const prices = data.prices || [];
-    const labels = prices.map(p => new Date(p[0]).toLocaleString());
-    const vals = prices.map(p => p[1]);
+    // apiFetch queues this call (min gap between any two API calls) and
+    // retries automatically with backoff if it gets a 429.
+    const data = await apiFetch(`${API_BASE}/coins/${coinId}/market_chart?vs_currency=${vsCurrency}&days=${days}&interval=hourly`);
 
-    if(detailChart) detailChart.destroy();
-    detailChart = new Chart(canvas.getContext('2d'), {
-      type: 'line',
-      data: { labels, datasets: [{ label: 'Price', data: vals, borderWidth: 2, tension: 0.15 }] },
-      options: {
-        plugins:{ legend:{display:false} }, scales: { x:{ display:false }, y:{ ticks:{ callback: (v)=>formatPrice(v) } } }, interaction:{mode:'index', intersect:false}
-      }
-    });
-  } catch (err) {
-    console.error(err);
-    if (detailChart) {
-      detailChart.destroy();
-      detailChart = null;
+    if (!data.prices || data.prices.length === 0) {
+      throw new Error('NO_DATA');
     }
 
-    const ctx = canvas.getContext("2d");
-    ctx.clearRect(0, 0, canvas.width, canvas.height); 
+    chartCache.set(cacheKey, { data, timestamp: Date.now() });
+    drawDetailChart(canvas, data);
+  } catch (err) {
+    console.error(err);
+    if (detailChart) { detailChart.destroy(); detailChart = null; }
+
+    const msg = err.message === 'RATE_LIMITED'
+      ? 'Still rate limited after retrying — wait ~10s and click again'
+      : err.message === 'NO_DATA'
+        ? 'No chart data available for this range'
+        : 'Failed to load chart';
+
+    showChartMessage(canvas, msg);
   }
+}
+
+function drawDetailChart(canvas, data){
+  const prices = data.prices || [];
+  const labels = prices.map(p => new Date(p[0]).toLocaleString());
+  const vals = prices.map(p => p[1]);
+
+  if(detailChart) detailChart.destroy();
+  detailChart = new Chart(canvas.getContext('2d'), {
+    type: 'line',
+    data: { labels, datasets: [{ label: 'Price', data: vals, borderWidth: 2, tension: 0.15 }] },
+    options: {
+      plugins:{ legend:{display:false} }, scales: { x:{ display:false }, y:{ ticks:{ callback: (v)=>formatPrice(v) } } }, interaction:{mode:'index', intersect:false}
+    }
+  });
+}
+
+// Show a plain text message on the canvas (loading / error states)
+function showChartMessage(canvas, msg){
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#888';
+  ctx.font = '14px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(msg, canvas.width / 2 || 140, canvas.height / 2 || 140);
+  ctx.textAlign = 'left';
 }
 
 // Modal close
@@ -346,6 +449,8 @@ function closeModal(){
   modal.setAttribute('aria-hidden','true');
   modal.style.display = 'none';
   if(detailChart) { detailChart.destroy(); detailChart = null; }
+  // resume background auto-refresh now that the modal is closed
+  startAutoRefresh();
 }
 
 // Search debounce
@@ -355,6 +460,8 @@ searchInput.addEventListener('input', debounce(()=>renderCards(filterCoins()), 3
 currencySelect.addEventListener('change', () => {
   vsCurrency = currencySelect.value;
   localStorage.setItem('cp_currency', vsCurrency);
+  chartCache.clear();       // cached chart data was for the old currency
+  coinDetailCache.clear();  // cached coin details include currency-specific prices
   fetchData();
 });
 
